@@ -1,7 +1,7 @@
 import express from 'express';
 import dotenv from 'dotenv';
-import voiceRoutes from './routes/voice.js';
-import recordingRoutes from './routes/recording.js';
+import voiceHandler from './routes/voice.js';
+import recordingHandler from './routes/recording.js';
 import pool from './db/client.js';
 import fs from 'fs/promises';
 
@@ -45,9 +45,9 @@ app.get('/health', async (req, res) => {
   res.json({ status, checks, timestamp: new Date().toISOString() });
 });
 
-// Placeholder routes
-app.use('/voice', voiceRoutes);
-app.use('/recording', recordingRoutes);
+// Twilio webhook routes
+app.post('/voice', voiceHandler);
+app.post('/recording-complete', recordingHandler);
 
 // 404 handler
 app.use((req, res) => {
@@ -61,5 +61,7 @@ app.use((err: Error, req: express.Request, res: express.Response, next: express.
 });
 
 app.listen(PORT, () => {
-    console.log(`Server running on port ${PORT}`);
+    console.log(`JOWCM Hotline server running on port ${PORT}`);
 });
+
+export default app;
