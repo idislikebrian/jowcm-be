@@ -1,0 +1,30 @@
+{
+  "name": "jowcm-hotline-server",
+  "version": "1.0.0",
+  "description": "JOWCM Raw Hotline - Twilio voice call handler",
+  "main": "dist/index.js",
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "axios": "^1.13.5",
+    "dotenv": "^17.3.1",
+    "express": "^5.2.1",
+    "pg": "^8.18.0",
+    "twilio": "^5.12.2"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.6",
+    "@types/node": "^22.19.11",
+    "@types/pg": "^8.16.0",
+    "tsx": "^4.19.4",
+    "typescript": "^5.9.3"
+  }
+}
