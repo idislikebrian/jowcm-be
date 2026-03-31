@@ -1,4 +1,5 @@
-import { validateRequest } from 'twilio';
+import twilio from 'twilio';
+const { validateRequest } = twilio;
 
 /**
  * Validates that a webhook request came from Twilio

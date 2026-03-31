@@ -14,11 +14,19 @@ export async function downloadAudio(url: string, localPath: string): Promise<voi
     fs.mkdirSync(dir, { recursive: true });
   }
 
+  // Twilio recording URLs require authentication
+  const accountSid = process.env.TWILIO_ACCOUNT_SID || '';
+  const authToken = process.env.TWILIO_AUTH_TOKEN || '';
+  const auth = Buffer.from(`${accountSid}:${authToken}`).toString('base64');
+
   const response = await axios({
     method: 'GET',
     url: url,
     responseType: 'stream',
     timeout: 30000,
+    headers: {
+      'Authorization': `Basic ${auth}`
+    }
   });
 
   const writer = fs.createWriteStream(localPath);

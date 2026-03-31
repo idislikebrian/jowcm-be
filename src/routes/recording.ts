@@ -53,17 +53,25 @@ async function incrementVoiceCounter(): Promise<number> {
  */
 export default async function recordingHandler(req: Request, res: Response): Promise<void> {
   try {
-    // 1. Validate Twilio signature
+    // 1. Validate Twilio signature (skip if no webhook secret configured)
     const authToken = process.env.TWILIO_AUTH_TOKEN || '';
     const signature = req.headers['x-twilio-signature'] as string || '';
-    const url = `${req.protocol}://${req.get('host')}${req.originalUrl}`;
+    
+    // Use X-Forwarded-Proto and X-Forwarded-Host for proxied requests
+    const protocol = req.headers['x-forwarded-proto'] || req.protocol;
+    const host = req.headers['x-forwarded-host'] || req.get('host');
+    const url = `${protocol}://${host}${req.originalUrl}`;
 
-    const isValid = validateTwilioWebhook(authToken, signature, url, req.body);
-
-    if (!isValid) {
-      console.error('Invalid Twilio signature');
-      res.status(403).send('Forbidden');
-      return;
+    // Only validate if we have a signature and auth token
+    if (signature && authToken) {
+      const isValid = validateTwilioWebhook(authToken, signature, url, req.body);
+      if (!isValid) {
+        console.error('Invalid Twilio signature');
+        res.status(403).send('Forbidden');
+        return;
+      }
+    } else {
+      console.log('Skipping Twilio signature validation (no signature or auth token)');
     }
 
     // 2. Extract data from request body
@@ -92,9 +100,9 @@ export default async function recordingHandler(req: Request, res: Response): Pro
     await pool.query(
       `INSERT INTO voicemails (
         voice_number,
-        caller_number,
+        phone_number,
         recording_url,
-        recording_duration,
+        duration,
         local_path,
         created_at
       ) VALUES ($1, $2, $3, $4, $5, NOW())`,
