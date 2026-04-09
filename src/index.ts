@@ -61,7 +61,7 @@ app.use((err: Error, req: express.Request, res: express.Response, next: express.
     res.status(500).json({ error: 'Internal server error' });
 });
 
-app.listen(PORT, () => {
+app.listen(Number(PORT), '0.0.0.0', () => {
     console.log(`JOWCM Hotline server running on port ${PORT}`);
     
     // Start the playlist assignment cron job
