@@ -4,7 +4,7 @@ import path from 'path';
 
 /**
  * Downloads audio from a URL and saves it to a local path
- * @param url - URL to download from (RecordingUrl + '.wav')
+ * @param url - URL to download from (RecordingUrl + explicit extension)
  * @param localPath - Local file path to save to
  */
 export async function downloadAudio(url: string, localPath: string): Promise<void> {

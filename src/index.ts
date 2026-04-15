@@ -4,7 +4,6 @@ import voiceHandler from './routes/voice.js';
 import recordingHandler from './routes/recording.js';
 import pool from './db/client.js';
 import fs from 'fs/promises';
-import { startPlaylistCron } from './services/playlist-cron.js';
 
 dotenv.config();
 
@@ -63,9 +62,6 @@ app.use((err: Error, req: express.Request, res: express.Response, next: express.
 
 app.listen(Number(PORT), '0.0.0.0', () => {
     console.log(`JOWCM Hotline server running on port ${PORT}`);
-    
-    // Start the playlist assignment cron job
-    startPlaylistCron();
 });
 
 export default app;

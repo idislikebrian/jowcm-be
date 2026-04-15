@@ -1,44 +1,134 @@
 import { Request, Response } from 'express';
+import { PoolClient } from 'pg';
 import pool from '../db/client.js';
 import { downloadAudio } from '../services/storage.js';
 import { validateTwilioWebhook } from '../utils/validateTwilio.js';
-import { addToPlaylist } from '../services/azurecast.js';
+import { updateUserStreak } from '../services/user-streak.js';
 import { sendConfirmation } from '../services/twilio.js';
+import { normalizePhoneNumber } from '../utils/normalizePhoneNumber.js';
+import { logEvent } from '../utils/logEvent.js';
+
+const VOICEMAIL_STORAGE_PATH = process.env.VOICEMAIL_STORAGE_PATH || '/var/voicemails';
+
+interface ExistingVoicemailRow {
+  id: number;
+  voice_number: number;
+}
+
+interface MetaRow {
+  value: string;
+}
 
 /**
  * Atomically increments the global_voice_count in the meta table
  * Uses a transaction with FOR UPDATE to prevent race conditions
  * @returns The new voice number (incremented count)
  */
-async function incrementVoiceCounter(): Promise<number> {
+async function incrementVoiceCounter(client: PoolClient): Promise<number> {
+  const result = await client.query<MetaRow>(
+    'SELECT value FROM meta WHERE key = $1 FOR UPDATE',
+    ['global_voice_count']
+  );
+
+  if (result.rows.length === 0) {
+    throw new Error('global_voice_count not found in meta table');
+  }
+
+  const current = parseInt(result.rows[0].value, 10);
+  const next = current + 1;
+
+  await client.query(
+    'UPDATE meta SET value = $1 WHERE key = $2',
+    [next, 'global_voice_count']
+  );
+
+  return next;
+}
+
+async function findExistingVoicemail(
+  client: Pick<PoolClient, 'query'>,
+  recordingSid: string
+): Promise<ExistingVoicemailRow | null> {
+  const existingResult = await client.query<ExistingVoicemailRow>(
+    'SELECT id, voice_number FROM voicemails WHERE recording_sid = $1 LIMIT 1',
+    [recordingSid]
+  );
+
+  return existingResult.rows[0] ?? null;
+}
+
+async function persistVoicemail(params: {
+  recordingSid: string;
+  phoneNumber: string | null;
+  recordingUrl: string;
+  recordingDuration: string | undefined;
+}): Promise<{ voiceNumber: number; localPath: string } | null> {
   const client = await pool.connect();
+
   try {
     await client.query('BEGIN');
-    const result = await client.query(
-      'SELECT value FROM meta WHERE key = $1 FOR UPDATE',
-      ['global_voice_count']
-    );
+    await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', [params.recordingSid]);
 
-    if (result.rows.length === 0) {
-      await client.query('ROLLBACK');
-      throw new Error('global_voice_count not found in meta table');
+    const existing = await findExistingVoicemail(client, params.recordingSid);
+    if (existing) {
+      logEvent('idempotent_retry_skipped', {
+        recording_sid: params.recordingSid,
+        voice_number: existing.voice_number,
+      });
+      await client.query('COMMIT');
+      return null;
     }
 
-    const current = parseInt(result.rows[0].value, 10);
-    const next = current + 1;
+    const voiceNumber = await incrementVoiceCounter(client);
+    const localPath = `${VOICEMAIL_STORAGE_PATH}/${voiceNumber}_${params.recordingSid}.mp3`;
+    const audioUrl = `${params.recordingUrl}.mp3`;
+
+    await downloadAudio(audioUrl, localPath);
 
     await client.query(
-      'UPDATE meta SET value = $1 WHERE key = $2',
-      [next, 'global_voice_count']
+      `INSERT INTO voicemails (
+        voice_number,
+        phone_number,
+        recording_sid,
+        recording_url,
+        duration,
+        local_path,
+        created_at
+      ) VALUES ($1, $2, $3, $4, $5, $6, NOW())`,
+      [
+        voiceNumber,
+        params.phoneNumber,
+        params.recordingSid,
+        params.recordingUrl,
+        parseInt(params.recordingDuration || '0', 10),
+        localPath,
+      ]
     );
+
     await client.query('COMMIT');
-    return next;
-  } catch (e) {
+
+    logEvent('voicemail_persisted', {
+      recording_sid: params.recordingSid,
+      voice_number: voiceNumber,
+      phone_number: params.phoneNumber,
+      local_path: localPath,
+    });
+
+    return { voiceNumber, localPath };
+  } catch (error) {
     await client.query('ROLLBACK');
-    throw e;
+    throw error;
   } finally {
     client.release();
   }
+}
+
+function twimlResponse(): string {
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say>Thank you for your message. Goodbye.</Say>
+  <Hangup/>
+</Response>`;
 }
 
 /**
@@ -48,7 +138,6 @@ async function incrementVoiceCounter(): Promise<number> {
  * - Atomically increments counter
  * - Downloads audio file
  * - Saves to database
- * - Adds to Azurecast playlist (best effort)
  * - Sends SMS confirmation (best effort)
  */
 export default async function recordingHandler(req: Request, res: Response): Promise<void> {
@@ -75,74 +164,77 @@ export default async function recordingHandler(req: Request, res: Response): Pro
     }
 
     // 2. Extract data from request body
-    const { From, RecordingUrl, RecordingDuration } = req.body;
+    const { From, RecordingUrl, RecordingDuration, RecordingSid } = req.body;
 
-    if (!From || !RecordingUrl) {
-      console.error('Missing required fields:', { From, RecordingUrl });
+    if (!RecordingUrl || !RecordingSid) {
+      console.error('Missing required fields:', { RecordingUrl, RecordingSid });
       res.status(400).send('Bad Request');
       return;
     }
 
-    console.log(`Processing recording from ${From}, URL: ${RecordingUrl}`);
+    const normalizedPhoneNumber = normalizePhoneNumber(From);
 
-    // 3. Atomically increment global_voice_count
-    const voiceNumber = await incrementVoiceCounter();
-    console.log(`Assigned voice number: ${voiceNumber}`);
-
-    // 4. Download audio file
-    const audioUrl = `${RecordingUrl}.wav`;
-    const localPath = `/var/voicemails/voice-${voiceNumber}.wav`;
-
-    await downloadAudio(audioUrl, localPath);
-    console.log(`Downloaded audio to: ${localPath}`);
-
-    // 5. Insert into voicemails table
-    await pool.query(
-      `INSERT INTO voicemails (
-        voice_number,
-        phone_number,
-        recording_url,
-        duration,
-        local_path,
-        created_at
-      ) VALUES ($1, $2, $3, $4, $5, NOW())`,
-      [
-        voiceNumber,
-        From,
-        RecordingUrl,
-        parseInt(RecordingDuration || '0', 10),
-        localPath
-      ]
+    const existingVoicemailResult = await pool.query<ExistingVoicemailRow>(
+      'SELECT id, voice_number FROM voicemails WHERE recording_sid = $1 LIMIT 1',
+      [RecordingSid]
     );
-    console.log(`Inserted voicemail record for voice-${voiceNumber}`);
+    const existingVoicemail = existingVoicemailResult.rows[0] ?? null;
 
-    // After: INSERT INTO voicemails ...
-
-    // 6. Add to Azurecast (fire and forget, but log errors)
-    try {
-      await addToPlaylist(localPath, voiceNumber);
-    } catch (err) {
-      console.error('[Azurecast] Failed to add to playlist:', err);
-      // Don't throw - we don't want to fail the webhook
+    if (existingVoicemail) {
+      logEvent('idempotent_retry_skipped', {
+        recording_sid: RecordingSid,
+        voice_number: existingVoicemail.voice_number,
+      });
+      res.set('Content-Type', 'text/xml');
+      res.send(twimlResponse());
+      return;
     }
 
-    // 7. Send SMS confirmation
-    try {
-      await sendConfirmation(From, voiceNumber);
-    } catch (err) {
-      console.error('[SMS] Failed to send confirmation:', err);
-      // Don't throw - SMS failure shouldn't break the flow
+    const persistedVoicemail = await persistVoicemail({
+      recordingSid: RecordingSid,
+      phoneNumber: normalizedPhoneNumber,
+      recordingUrl: RecordingUrl,
+      recordingDuration: RecordingDuration,
+    });
+
+    if (!persistedVoicemail) {
+      res.set('Content-Type', 'text/xml');
+      res.send(twimlResponse());
+      return;
     }
 
-    // 8. Return empty TwiML (call ends naturally)
-    const twiml = `<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Say>Thank you for your message. Goodbye.</Say>
-  <Hangup/>
-</Response>`;
+    const { voiceNumber } = persistedVoicemail;
+
+    if (normalizedPhoneNumber) {
+      try {
+        const userState = await updateUserStreak(normalizedPhoneNumber, new Date());
+        try {
+          await sendConfirmation(normalizedPhoneNumber, voiceNumber, userState.streakCount);
+        } catch (err) {
+          logEvent('sms_failure', {
+            phone_number: normalizedPhoneNumber,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+      } catch (err) {
+        logEvent('streak_update_failed', {
+          phone_number: normalizedPhoneNumber,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    } else if (From) {
+      logEvent('phone_number_skipped', {
+        raw_from: From,
+        reason: 'unusable_phone_number',
+      });
+    } else {
+      logEvent('phone_number_skipped', {
+        reason: 'missing_from',
+      });
+    }
 
     res.set('Content-Type', 'text/xml');
-    res.send(twiml);
+    res.send(twimlResponse());
 
   } catch (error) {
     console.error('Error processing recording:', error);
