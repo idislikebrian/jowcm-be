@@ -156,6 +156,8 @@ pm2 save
 pm2 startup
 ```
 
+**Current live deployment note:** on this box, `jowcm-hotline` is not managed via a standalone `pm2 start`/`pm2 save` as shown above — it's one of three apps supervised by the systemd-managed `pm2-root.service` daemon, alongside two unrelated Discord bots (`theprincipal`, `fred-from-hr`). Before running any `pm2` command against the live process, read `/root/AGENTS.md` — the interactive `pm2` CLI on this box has a known split-brain trap that makes `pm2 list`/`restart`/`stop` silently lie about what's running.
+
 ### Nginx Reverse Proxy
 
 ```nginx
