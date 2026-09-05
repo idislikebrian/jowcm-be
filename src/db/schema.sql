@@ -16,6 +16,13 @@ ALTER TABLE voicemails
 ALTER TABLE voicemails
     ADD COLUMN IF NOT EXISTS recording_sid TEXT;
 
+-- Tracks whether the AzuraCast media handoff has succeeded for this voicemail.
+-- NULL means "not yet synced" (either never attempted or attempted and failed);
+-- a replayed webhook for an already-persisted recording uses this to repair a
+-- missing handoff without re-running streak/SMS side effects.
+ALTER TABLE voicemails
+    ADD COLUMN IF NOT EXISTS azuracast_synced_at TIMESTAMPTZ;
+
 CREATE UNIQUE INDEX IF NOT EXISTS voicemails_recording_sid_idx
     ON voicemails (recording_sid)
     WHERE recording_sid IS NOT NULL;

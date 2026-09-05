@@ -2,8 +2,8 @@ import express from 'express';
 import dotenv from 'dotenv';
 import voiceHandler from './routes/voice.js';
 import recordingHandler from './routes/recording.js';
-import pool from './db/client.js';
-import fs from 'fs/promises';
+import { startPlaylistCron } from './services/playlist-cron.js';
+import { getHealthReport } from './services/health.js';
 
 dotenv.config();
 
@@ -14,35 +14,11 @@ const PORT = process.env.PORT || 3000;
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 
-// Health check endpoint with detailed status
+// Health check endpoint — see src/services/health.ts for the component contract
 app.get('/health', async (req, res) => {
-  const checks = {
-    db: false,
-    twilio: false,
-    storage: false,
-  };
-
-  // Check DB
-  try {
-    await pool.query('SELECT 1');
-    checks.db = true;
-  } catch (e) {
-    console.error('DB health check failed:', e);
-  }
-
-  // Check Twilio env
-  checks.twilio = !!(process.env.TWILIO_ACCOUNT_SID && process.env.TWILIO_AUTH_TOKEN);
-
-  // Check storage
-  try {
-    await fs.access(process.env.VOICEMAIL_STORAGE_PATH || '/var/voicemails', fs.constants.W_OK);
-    checks.storage = true;
-  } catch (e) {
-    console.error('Storage health check failed:', e);
-  }
-
-  const status = checks.db && checks.twilio && checks.storage ? 'ok' : 'degraded';
-  res.json({ status, checks, timestamp: new Date().toISOString() });
+  const report = await getHealthReport();
+  const httpStatus = report.status === 'error' ? 503 : 200;
+  res.status(httpStatus).json(report);
 });
 
 // Twilio webhook routes
@@ -63,5 +39,8 @@ app.use((err: Error, req: express.Request, res: express.Response, next: express.
 app.listen(Number(PORT), '0.0.0.0', () => {
     console.log(`JOWCM Hotline server running on port ${PORT}`);
 });
+
+// Starts only when AzuraCast API config is present; logs and no-ops otherwise.
+startPlaylistCron();
 
 export default app;

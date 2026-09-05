@@ -66,6 +66,14 @@ psql jowcm_hotline < src/db/schema.sql
 - `voicemails` table — stores call records
 - `meta` table — global voice counter (starts at 0)
 
+**Updating an existing production database:** `schema.sql` is safe to re-run in full (every statement is idempotent), but for a targeted, minimal-diff production change, apply the one-off script(s) in `src/db/migrations/` instead, in filename order, e.g.:
+
+```bash
+psql "$DATABASE_URL" -f src/db/migrations/2026-09-05_add_azuracast_synced_at.sql
+```
+
+Apply pending migrations *before* deploying the backend code/restarting the process — code that expects a new column will error on every request until the column exists.
+
 ### 4. Build & Run
 
 ```bash

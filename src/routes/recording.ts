@@ -7,12 +7,15 @@ import { updateUserStreak } from '../services/user-streak.js';
 import { sendConfirmation } from '../services/twilio.js';
 import { normalizePhoneNumber } from '../utils/normalizePhoneNumber.js';
 import { logEvent } from '../utils/logEvent.js';
+import { addToPlaylist } from '../services/azurecast.js';
 
 const VOICEMAIL_STORAGE_PATH = process.env.VOICEMAIL_STORAGE_PATH || '/var/voicemails';
 
 interface ExistingVoicemailRow {
   id: number;
   voice_number: number;
+  local_path: string;
+  azuracast_synced_at: Date | null;
 }
 
 interface MetaRow {
@@ -50,7 +53,7 @@ async function findExistingVoicemail(
   recordingSid: string
 ): Promise<ExistingVoicemailRow | null> {
   const existingResult = await client.query<ExistingVoicemailRow>(
-    'SELECT id, voice_number FROM voicemails WHERE recording_sid = $1 LIMIT 1',
+    'SELECT id, voice_number, local_path, azuracast_synced_at FROM voicemails WHERE recording_sid = $1 LIMIT 1',
     [recordingSid]
   );
 
@@ -62,7 +65,7 @@ async function persistVoicemail(params: {
   phoneNumber: string | null;
   recordingUrl: string;
   recordingDuration: string | undefined;
-}): Promise<{ voiceNumber: number; localPath: string } | null> {
+}): Promise<{ id: number; voiceNumber: number; localPath: string } | null> {
   const client = await pool.connect();
 
   try {
@@ -85,7 +88,7 @@ async function persistVoicemail(params: {
 
     await downloadAudio(audioUrl, localPath);
 
-    await client.query(
+    const insertResult = await client.query<{ id: number }>(
       `INSERT INTO voicemails (
         voice_number,
         phone_number,
@@ -94,7 +97,8 @@ async function persistVoicemail(params: {
         duration,
         local_path,
         created_at
-      ) VALUES ($1, $2, $3, $4, $5, $6, NOW())`,
+      ) VALUES ($1, $2, $3, $4, $5, $6, NOW())
+      RETURNING id`,
       [
         voiceNumber,
         params.phoneNumber,
@@ -114,12 +118,47 @@ async function persistVoicemail(params: {
       local_path: localPath,
     });
 
-    return { voiceNumber, localPath };
+    return { id: insertResult.rows[0].id, voiceNumber, localPath };
   } catch (error) {
     await client.query('ROLLBACK');
     throw error;
   } finally {
     client.release();
+  }
+}
+
+async function markAzuracastSynced(voicemailId: number): Promise<void> {
+  await pool.query(
+    'UPDATE voicemails SET azuracast_synced_at = NOW() WHERE id = $1',
+    [voicemailId]
+  );
+}
+
+/**
+ * Attempts the AzuraCast handoff for an already-persisted voicemail and marks
+ * it synced on success. The destination filename is deterministic
+ * (`voice-{voiceNumber}.<ext>`), so re-running this for an already-synced or
+ * previously-failed voicemail is a safe overwrite, not a duplicate.
+ */
+async function handOffToAzuracast(params: {
+  recordingSid: string;
+  voicemailId: number;
+  voiceNumber: number;
+  localPath: string;
+}): Promise<void> {
+  try {
+    await addToPlaylist(params.localPath, params.voiceNumber);
+    await markAzuracastSynced(params.voicemailId);
+    logEvent('azuracast_handoff_succeeded', {
+      recording_sid: params.recordingSid,
+      voice_number: params.voiceNumber,
+    });
+  } catch (err) {
+    logEvent('azuracast_handoff_failed', {
+      recording_sid: params.recordingSid,
+      voice_number: params.voiceNumber,
+      error: err instanceof Error ? err.message : String(err),
+    });
   }
 }
 
@@ -175,7 +214,7 @@ export default async function recordingHandler(req: Request, res: Response): Pro
     const normalizedPhoneNumber = normalizePhoneNumber(From);
 
     const existingVoicemailResult = await pool.query<ExistingVoicemailRow>(
-      'SELECT id, voice_number FROM voicemails WHERE recording_sid = $1 LIMIT 1',
+      'SELECT id, voice_number, local_path, azuracast_synced_at FROM voicemails WHERE recording_sid = $1 LIMIT 1',
       [RecordingSid]
     );
     const existingVoicemail = existingVoicemailResult.rows[0] ?? null;
@@ -185,6 +224,21 @@ export default async function recordingHandler(req: Request, res: Response): Pro
         recording_sid: RecordingSid,
         voice_number: existingVoicemail.voice_number,
       });
+
+      // The voicemail itself is already persisted (exactly-once). Streak/SMS
+      // must not re-run on a replay, but a previously-failed AzuraCast handoff
+      // is independently safe to retry here: the watch-folder filename is
+      // deterministic on voiceNumber, so re-dropping the file is a no-op/overwrite,
+      // never a duplicate station media item.
+      if (!existingVoicemail.azuracast_synced_at) {
+        await handOffToAzuracast({
+          recordingSid: RecordingSid,
+          voicemailId: existingVoicemail.id,
+          voiceNumber: existingVoicemail.voice_number,
+          localPath: existingVoicemail.local_path,
+        });
+      }
+
       res.set('Content-Type', 'text/xml');
       res.send(twimlResponse());
       return;
@@ -203,7 +257,14 @@ export default async function recordingHandler(req: Request, res: Response): Pro
       return;
     }
 
-    const { voiceNumber } = persistedVoicemail;
+    const { id: voicemailId, voiceNumber, localPath } = persistedVoicemail;
+
+    await handOffToAzuracast({
+      recordingSid: RecordingSid,
+      voicemailId,
+      voiceNumber,
+      localPath,
+    });
 
     if (normalizedPhoneNumber) {
       try {
